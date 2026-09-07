@@ -29,9 +29,13 @@ def handler(event, context):
         f"Reason: {reason}\n"
         f"Action: {json.dumps(action)}\n"
     )
+    # SNS subjects are capped at 100 chars and publish() rejects the whole
+    # call if exceeded - full session_id already lives in the message body,
+    # so keep the subject to just the category and truncate defensively.
+    subject = f"AgentShield ALERT - {category}"[:100]
     sns.publish(
         TopicArn=ALERTS_TOPIC_ARN,
-        Subject=f"AgentShield ALERT - {category} - session {session_id}",
+        Subject=subject,
         Message=message,
     )
 
