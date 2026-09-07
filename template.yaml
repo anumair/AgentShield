@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AgentShield - cloud-native containment and monitoring framework for testing
+  agentic AI models. Defines the sandbox VPC, the four Lambdas (agent,
+  policy, egress, kill-switch), the DynamoDB audit trail, the API Gateway
+  entry point, and the SNS alerting topic described in the project report.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 15
+    MemorySize: 128
+    Tracing: Active
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address to subscribe to the AgentShieldAlerts SNS topic.
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # Network: isolated sandbox (private, no IGW route) + egress subnet
+  # ---------------------------------------------------------------------
+  AgentShieldVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: agentshield-vpc
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AgentShieldVpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: agentshield-private-subnet
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AgentShieldVpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: agentshield-public-subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AgentShieldVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AgentShieldVpc
+      Tags:
+        - Key: Name
+          Value: agentshield-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AgentShieldVpc
+      Tags:
+        - Key: Name
+          Value: agentshield-private-rt
+      # Deliberately no route to the InternetGateway or a NAT gateway here -
+      # this is the containment boundary. The private subnet can only reach
+      # the DynamoDB gateway endpoint below.
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref AgentShieldVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  SandboxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >
+        Agent Lambda SG - no inbound, outbound restricted to the DynamoDB
+        gateway endpoint and the execute-api interface endpoint only. No
+        IGW/NAT route exists on this subnet's route table, so the public
+        internet is unreachable regardless of this SG's rules - containment
+        is enforced at the routing layer first, the SG second.
+      VpcId: !Ref AgentShieldVpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref ExecuteApiEndpointSecurityGroup
+          Description: HTTPS to the private execute-api endpoint only
+
+  ExecuteApiEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows the sandboxed Agent Lambda to reach the execute-api interface endpoint.
+      VpcId: !Ref AgentShieldVpc
+
+  ExecuteApiEndpointIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ExecuteApiEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref SandboxSecurityGroup
+
+  ExecuteApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref AgentShieldVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.execute-api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref ExecuteApiEndpointSecurityGroup
+
+  EgressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress Lambda SG - the only Lambda allowed a real internet path.
+      VpcId: !Ref AgentShieldVpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  # ---------------------------------------------------------------------
+  # DynamoDB: audit trail + kill-switch flag
+  # ---------------------------------------------------------------------
+  AgentShieldLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: AgentShieldLogs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  AgentShieldSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: AgentShieldSessions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+
+  # ---------------------------------------------------------------------
+  # Alerting
+  # ---------------------------------------------------------------------
+  AgentShieldAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: AgentShieldAlerts
+
+  AgentShieldAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AgentShieldAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------------
+  # API Gateway entry point (Agent -> Policy)
+  # ---------------------------------------------------------------------
+  ActionApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+
+  # ---------------------------------------------------------------------
+  # Lambdas
+  # ---------------------------------------------------------------------
+  PolicyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agentshield-policy
+      CodeUri: policy_lambda/
+      Handler: app.handler
+      Environment:
+        Variables:
+          LOGS_TABLE: !Ref AgentShieldLogsTable
+          KILLSWITCH_FUNCTION_NAME: agentshield-killswitch
+          EGRESS_FUNCTION_NAME: agentshield-egress
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref AgentShieldLogsTable
+        - LambdaInvokePolicy:
+            FunctionName: agentshield-killswitch
+        - LambdaInvokePolicy:
+            FunctionName: agentshield-egress
+      Events:
+        Action:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ActionApi
+            Path: /action
+            Method: POST
+    DependsOn:
+      - KillSwitchFunction
+      - EgressFunction
+
+  EgressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agentshield-egress
+      CodeUri: egress_lambda/
+      Handler: app.handler
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref EgressSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnet
+      Policies:
+        - CloudWatchLogsFullAccess
+
+  KillSwitchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agentshield-killswitch
+      CodeUri: killswitch_lambda/
+      Handler: app.handler
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref AgentShieldSessionsTable
+          ALERTS_TOPIC_ARN: !Ref AgentShieldAlertsTopic
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref AgentShieldSessionsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AgentShieldAlertsTopic.TopicName
+
+  AgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agentshield-agent
+      CodeUri: agent_lambda/
+      Handler: app.handler
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SandboxSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref AgentShieldSessionsTable
+          ACTION_API_URL: !Sub https://${ActionApi}.execute-api.${AWS::Region}.amazonaws.com/prod/action
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AgentShieldSessionsTable
+
+Outputs:
+  ActionApiUrl:
+    Description: Invoke URL for the Policy Lambda's /action endpoint
+    Value: !Sub https://${ActionApi}.execute-api.${AWS::Region}.amazonaws.com/prod/action
+  AgentFunctionName:
+    Value: !Ref AgentFunction
+  LogsTableName:
+    Value: !Ref AgentShieldLogsTable
+  SessionsTableName:
+    Value: !Ref AgentShieldSessionsTable
+  AlertsTopicArn:
+    Value: !Ref AgentShieldAlertsTopic
