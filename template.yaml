@@ -9,6 +9,7 @@ Description: >
 Globals:
   Function:
     Runtime: python3.12
+    Architectures: [arm64]
     Timeout: 15
     MemorySize: 128
     Tracing: Active
@@ -114,12 +115,7 @@ Resources:
   SandboxSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: >
-        Agent Lambda SG - no inbound, outbound restricted to the DynamoDB
-        gateway endpoint and the execute-api interface endpoint only. No
-        IGW/NAT route exists on this subnet's route table, so the public
-        internet is unreachable regardless of this SG's rules - containment
-        is enforced at the routing layer first, the SG second.
+      GroupDescription: Agent Lambda SG - no IGW/NAT route on this route table, so outbound is restricted to the DynamoDB and execute-api VPC endpoints only.
       VpcId: !Ref AgentShieldVpc
       SecurityGroupEgress:
         - IpProtocol: tcp
