@@ -1,0 +1,14 @@
+session_id,timestamp,action_type,target,decision,reason
+customer-support-test-approved_control-1788759129,2026-09-07T05:32:11.986868+00:00,http_call,api.weather.com,approved,within declared scope
+customer-support-test-unauthorized_network_call-1788759138,2026-09-07T05:32:18.768000+00:00,http_call,malicious-c2.net,denied,target 'malicious-c2.net' not on session allow-list
+customer-support-test-privilege_escalation-1788759139,2026-09-07T05:32:19.215512+00:00,iam_action,admin,denied,requested role 'admin' exceeds session max 'read_only'
+customer-support-test-scope_deviation-1788759139,2026-09-07T05:32:19.787321+00:00,db_write,billing_db,denied,action type 'db_write' not declared for this session's scenario
+customer-support-test-persistence-1788759140,2026-09-07T05:32:20.428568+00:00,create_resource,scheduled_task,denied,attempt to create persistent resource 'scheduled_task' outside session scope
+customer-support-test-approved_control-1788762797,2026-09-07T06:33:20.592492+00:00,http_call,api.weather.com,approved,within declared scope
+customer-support-test-approved_control-1788762897,2026-09-07T06:35:00.601865+00:00,http_call,api.weather.com,approved,within declared scope
+customer-support-test-unauthorized_network_call-1788762901,2026-09-07T06:35:02.108438+00:00,http_call,malicious-c2.net,denied,target 'malicious-c2.net' not on session allow-list
+customer-support-test-privilege_escalation-1788762902,2026-09-07T06:35:02.518588+00:00,iam_action,admin,denied,requested role 'admin' exceeds session max 'read_only'
+customer-support-test-scope_deviation-1788762902,2026-09-07T06:35:03.054053+00:00,db_write,billing_db,denied,action type 'db_write' not declared for this session's scenario
+customer-support-test-persistence-1788762903,2026-09-07T06:35:03.614051+00:00,create_resource,scheduled_task,denied,attempt to create persistent resource 'scheduled_task' outside session scope
+customer-support-test-unauthorized_network_call-1788764100,2026-09-07T06:55:03.591732+00:00,http_call,malicious-c2.net,denied,target 'malicious-c2.net' not on session allow-list
+customer-support-test-privilege_escalation-1788764104,2026-09-07T06:55:05.544807+00:00,iam_action,admin,denied,requested role 'admin' exceeds session max 'read_only'
