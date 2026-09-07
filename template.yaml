@@ -22,7 +22,8 @@ Parameters:
 Resources:
 
   # ---------------------------------------------------------------------
-  # Network: isolated sandbox (private, no IGW route) + egress subnet
+  # Network: isolated sandbox - one subnet, no IGW/NAT route at all. Only
+  # the Agent Lambda lives here; Egress runs outside the VPC (see below).
   # ---------------------------------------------------------------------
   AgentShieldVpc:
     Type: AWS::EC2::VPC
@@ -43,48 +44,6 @@ Resources:
       Tags:
         - Key: Name
           Value: agentshield-private-subnet
-
-  PublicSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref AgentShieldVpc
-      CidrBlock: 10.42.2.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: true
-      Tags:
-        - Key: Name
-          Value: agentshield-public-subnet
-
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-
-  VpcGatewayAttachment:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref AgentShieldVpc
-      InternetGatewayId: !Ref InternetGateway
-
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref AgentShieldVpc
-      Tags:
-        - Key: Name
-          Value: agentshield-public-rt
-
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: VpcGatewayAttachment
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-
-  PublicSubnetRouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref PublicRouteTable
 
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
@@ -115,50 +74,38 @@ Resources:
   SandboxSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Agent Lambda SG - no IGW/NAT route on this route table, so outbound is restricted to the DynamoDB and execute-api VPC endpoints only.
+      GroupDescription: Agent Lambda SG - no IGW/NAT route exists on this route table, so this rule cannot actually reach the public internet regardless of protocol/port.
       VpcId: !Ref AgentShieldVpc
       SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          DestinationSecurityGroupId: !Ref ExecuteApiEndpointSecurityGroup
-          Description: HTTPS to the private execute-api endpoint only
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
 
-  ExecuteApiEndpointSecurityGroup:
+  LambdaEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allows the sandboxed Agent Lambda to reach the execute-api interface endpoint.
+      GroupDescription: Allows the sandboxed Agent Lambda to reach the lambda interface endpoint.
       VpcId: !Ref AgentShieldVpc
 
-  ExecuteApiEndpointIngress:
+  LambdaEndpointIngress:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
-      GroupId: !Ref ExecuteApiEndpointSecurityGroup
+      GroupId: !Ref LambdaEndpointSecurityGroup
       IpProtocol: tcp
       FromPort: 443
       ToPort: 443
       SourceSecurityGroupId: !Ref SandboxSecurityGroup
 
-  ExecuteApiEndpoint:
+  LambdaEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref AgentShieldVpc
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.execute-api
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.lambda
       VpcEndpointType: Interface
       PrivateDnsEnabled: true
       SubnetIds:
         - !Ref PrivateSubnet
       SecurityGroupIds:
-        - !Ref ExecuteApiEndpointSecurityGroup
-
-  EgressSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Egress Lambda SG - the only Lambda allowed a real internet path.
-      VpcId: !Ref AgentShieldVpc
-      SecurityGroupEgress:
-        - IpProtocol: "-1"
-          CidrIp: 0.0.0.0/0
+        - !Ref LambdaEndpointSecurityGroup
 
   # ---------------------------------------------------------------------
   # DynamoDB: audit trail + kill-switch flag
@@ -252,11 +199,13 @@ Resources:
       FunctionName: agentshield-egress
       CodeUri: egress_lambda/
       Handler: app.handler
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref EgressSecurityGroup
-        SubnetIds:
-          - !Ref PublicSubnet
+      # Deliberately NOT VPC-attached: Lambda ENIs never get a public IP, so
+      # a VPC subnet needs an actual NAT Gateway (a real cost) to reach the
+      # internet - an IGW route alone is not enough. Default (non-VPC)
+      # Lambda networking already has full internet access for free. This
+      # is still the only component with a real path out: the sandbox's
+      # isolation is enforced by the Agent Lambda having no route at all,
+      # not by where Egress itself happens to run.
       Policies:
         - CloudWatchLogsFullAccess
 
@@ -291,10 +240,13 @@ Resources:
       Environment:
         Variables:
           SESSIONS_TABLE: !Ref AgentShieldSessionsTable
-          ACTION_API_URL: !Sub https://${ActionApi}.execute-api.${AWS::Region}.amazonaws.com/prod/action
+          POLICY_FUNCTION_NAME: agentshield-policy
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref AgentShieldSessionsTable
+        - LambdaInvokePolicy:
+            FunctionName: agentshield-policy
+    DependsOn: PolicyFunction
 
 Outputs:
   ActionApiUrl:

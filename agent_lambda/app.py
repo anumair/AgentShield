@@ -1,8 +1,6 @@
 import json
 import logging
 import os
-import urllib.error
-import urllib.request
 
 import boto3
 
@@ -10,8 +8,9 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource("dynamodb")
+lambda_client = boto3.client("lambda")
 SESSIONS_TABLE = os.environ["SESSIONS_TABLE"]
-ACTION_API_URL = os.environ["ACTION_API_URL"]
+POLICY_FUNCTION_NAME = os.environ["POLICY_FUNCTION_NAME"]
 
 DEFAULT_SESSION = "customer-support-test"
 
@@ -34,15 +33,17 @@ def is_frozen(session_id: str) -> bool:
 
 
 def call_policy_gateway(action: dict) -> dict:
-    data = json.dumps(action).encode("utf-8")
-    request = urllib.request.Request(
-        ACTION_API_URL, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    # Invoked directly over the private "lambda" service VPC endpoint - the
+    # sandbox has no route to the public internet, so this is the only path
+    # out of it. Kept as a plain Lambda invoke rather than routing through
+    # API Gateway, since private (VPC-only) access to an HTTP API is not a
+    # reliably supported pattern the way it is for REST APIs.
+    response = lambda_client.invoke(
+        FunctionName=POLICY_FUNCTION_NAME,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(action).encode("utf-8"),
     )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        return {"decision": "error", "reason": f"gateway returned {exc.code}"}
+    return json.loads(response["Payload"].read())
 
 
 def handler(event, context):

@@ -69,8 +69,17 @@ def _log(action: dict, result: dict) -> None:
 
 
 def handler(event, context):
-    body = event.get("body")
-    action = json.loads(body) if isinstance(body, str) else (body or {})
+    # Two invocation paths reach this function: a direct Lambda invoke from
+    # the sandboxed Agent Lambda (event *is* the action), and an optional
+    # API Gateway HttpApi call for manual/external testing (event carries a
+    # "requestContext" and a JSON-string "body").
+    if isinstance(event, dict) and "requestContext" in event:
+        via_api_gateway = True
+        body = event.get("body")
+        action = json.loads(body) if isinstance(body, str) else (body or {})
+    else:
+        via_api_gateway = False
+        action = event or {}
 
     result = evaluate(action)
     _log(action, result)
@@ -94,8 +103,10 @@ def handler(event, context):
         )
         response_body["egress_result"] = json.loads(egress_response["Payload"].read())
 
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(response_body),
-    }
+    if via_api_gateway:
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(response_body),
+        }
+    return response_body
